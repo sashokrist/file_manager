@@ -9,6 +9,8 @@
  * - GET /api/index.php?action=download&id=X - Download file
  * - DELETE /api/index.php?action=delete_file&id=X - Delete file
  * - DELETE /api/index.php?action=delete_directory&id=X - Delete directory
+ * - POST /api/index.php?action=move_file - Move file
+ * - POST /api/index.php?action=copy_file - Copy file
  */
 
 require_once __DIR__ . '/config.php';
@@ -61,6 +63,10 @@ try {
             
         case 'move_file':
             handleMoveFile($db);
+            break;
+            
+        case 'copy_file':
+            handleCopyFile($db);
             break;
             
         case 'bulk_delete_files':
@@ -745,6 +751,138 @@ function handleMoveFile($db) {
     } catch (PDOException $e) {
         // Rollback: move file back
         rename($newFullPath, $oldFullPath);
+        http_response_code(500);
+        echo json_encode(['error' => 'Database error: ' . $e->getMessage()]);
+    }
+}
+
+/**
+ * Handle file copy
+ */
+function handleCopyFile($db) {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(['error' => 'Method not allowed']);
+        return;
+    }
+    
+    $user_id = $_POST['user_id'] ?? null;
+    $file_id = $_POST['file_id'] ?? null;
+    $target_directory_path = $_POST['target_directory_path'] ?? '';
+    
+    if (!$user_id || !$file_id) {
+        http_response_code(400);
+        echo json_encode(['error' => 'user_id and file_id are required']);
+        return;
+    }
+    
+    // Get file info
+    $stmt = $db->prepare("SELECT * FROM archive_files WHERE id = ?");
+    $stmt->execute([$file_id]);
+    $file = $stmt->fetch();
+    
+    if (!$file) {
+        http_response_code(404);
+        echo json_encode(['error' => 'File not found']);
+        return;
+    }
+    
+    // Check permissions: user can only copy own files, unless admin
+    if (!isAdmin($user_id) && (int)$file['user_id'] !== (int)$user_id) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Access denied']);
+        return;
+    }
+    
+    $username = strtolower(trim($file['username']));
+    $target_directory_path = trim($target_directory_path, '/');
+    
+    // Build source and target paths
+    $sourceFullPath = UPLOAD_DIR . $file['path'];
+    
+    if (!file_exists($sourceFullPath)) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Source file not found on disk']);
+        return;
+    }
+    
+    $userMainDir = UPLOAD_DIR . $username . '/';
+    
+    $newDirectoryPath = $userMainDir;
+    if (!empty($target_directory_path)) {
+        $pathParts = explode('/', $target_directory_path);
+        foreach ($pathParts as $part) {
+            $part = sanitizePath($part);
+            if (!empty($part)) {
+                $newDirectoryPath .= $part . '/';
+            }
+        }
+    }
+    
+    // Generate unique filename for the copy
+    $originalName = $file['original_name'];
+    $extension = pathinfo($originalName, PATHINFO_EXTENSION);
+    $baseName = pathinfo($originalName, PATHINFO_FILENAME);
+    $storedName = $baseName . '_' . time() . '_' . uniqid() . '.' . $extension;
+    
+    $newFullPath = $newDirectoryPath . $storedName;
+    $newRelativePath = $username . '/' . ($target_directory_path ? $target_directory_path . '/' : '') . $storedName;
+    
+    // Ensure target directory exists
+    if (!file_exists($newDirectoryPath)) {
+        if (!mkdir($newDirectoryPath, 0755, true)) {
+            http_response_code(500);
+            echo json_encode(['error' => 'Failed to create target directory']);
+            return;
+        }
+    }
+    
+    // Copy file
+    if (!copy($sourceFullPath, $newFullPath)) {
+        http_response_code(500);
+        echo json_encode(['error' => 'Failed to copy file']);
+        return;
+    }
+    
+    // Create new database entry
+    try {
+        $insertStmt = $db->prepare("
+            INSERT INTO archive_files 
+            (user_id, username, original_name, stored_name, path, directory_path, mime, size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        $insertStmt->execute([
+            $file['user_id'],
+            $file['username'],
+            $originalName,
+            $storedName,
+            $newRelativePath,
+            $target_directory_path,
+            $file['mime'] ?? 'application/octet-stream',
+            $file['size']
+        ]);
+        
+        $newFileId = $db->lastInsertId();
+        
+        echo json_encode([
+            'success' => true,
+            'message' => 'File copied successfully',
+            'file' => [
+                'id' => $newFileId,
+                'original_name' => $originalName,
+                'stored_name' => $storedName,
+                'path' => $newRelativePath,
+                'directory_path' => $target_directory_path,
+                'mime' => $file['mime'] ?? 'application/octet-stream',
+                'size' => $file['size'],
+                'created_at' => date('Y-m-d H:i:s')
+            ]
+        ]);
+    } catch (PDOException $e) {
+        // Rollback: delete copied file
+        if (file_exists($newFullPath)) {
+            unlink($newFullPath);
+        }
         http_response_code(500);
         echo json_encode(['error' => 'Database error: ' . $e->getMessage()]);
     }
