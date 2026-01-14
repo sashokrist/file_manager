@@ -6,9 +6,9 @@
 // Database configuration for Archive API
 define('DB_HOST', '127.0.0.1');
 define('DB_PORT', '3306');
-define('DB_NAME', 'archive_api');
-define('DB_USER', 'root');
-define('DB_PASS', '');
+define('DB_NAME', 'hsb2b_archive_api');
+define('DB_USER', 'hsb2b_sasho');
+define('DB_PASS', 'Jana009@');
 
 // File upload settings
 define('MAX_FILE_SIZE', 256 * 1024 * 1024); // 256MB in bytes
