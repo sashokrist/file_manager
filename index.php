@@ -15,10 +15,14 @@
 
 require_once __DIR__ . '/config.php';
 
+// Performance headers for large file uploads
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Connection: keep-alive');
+header('Keep-Alive: timeout=300, max=1000');
+header('X-Accel-Buffering: no'); // Disable nginx buffering for real-time progress
 
 // Handle preflight requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -111,18 +115,44 @@ function handleUpload($db) {
         return;
     }
     
-    if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+    if (!isset($_FILES['file'])) {
         http_response_code(400);
-        echo json_encode(['error' => 'No file uploaded or upload error']);
+        echo json_encode(['error' => 'No file uploaded']);
         return;
     }
     
     $file = $_FILES['file'];
     
+    // Handle upload errors with detailed messages
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $errorMessages = [
+            UPLOAD_ERR_INI_SIZE => 'File exceeds upload_max_filesize directive',
+            UPLOAD_ERR_FORM_SIZE => 'File exceeds MAX_FILE_SIZE directive',
+            UPLOAD_ERR_PARTIAL => 'File was only partially uploaded',
+            UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+            UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder',
+            UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+            UPLOAD_ERR_EXTENSION => 'File upload stopped by extension',
+        ];
+        
+        $errorMsg = $errorMessages[$file['error']] ?? 'Unknown upload error';
+        http_response_code(400);
+        echo json_encode(['error' => $errorMsg, 'error_code' => $file['error']]);
+        return;
+    }
+    
     // Check file size
     if ($file['size'] > MAX_FILE_SIZE) {
         http_response_code(400);
-        echo json_encode(['error' => 'File size exceeds maximum allowed size of 256MB']);
+        $maxSizeMB = MAX_FILE_SIZE / (1024 * 1024);
+        echo json_encode(['error' => "File size exceeds maximum allowed size of {$maxSizeMB}MB"]);
+        return;
+    }
+    
+    // Check if connection is still alive
+    if (connection_aborted()) {
+        http_response_code(499);
+        echo json_encode(['error' => 'Client disconnected during upload']);
         return;
     }
     
@@ -161,36 +191,113 @@ function handleUpload($db) {
     $baseName = pathinfo($originalName, PATHINFO_FILENAME);
     $storedName = $baseName . '_' . time() . '_' . uniqid() . '.' . $extension;
     
-    // Move uploaded file
+    // Move uploaded file with retry logic for connection drops
     $targetPath = $fullDirectoryPath . $storedName;
-    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+    $maxRetries = 3;
+    $retryDelay = 1; // seconds
+    $moved = false;
+    
+    for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+        // Check connection before each attempt
+        if (connection_aborted()) {
+            // Clean up temp file if exists
+            if (file_exists($file['tmp_name'])) {
+                @unlink($file['tmp_name']);
+            }
+            http_response_code(499);
+            echo json_encode(['error' => 'Client disconnected during upload', 'attempt' => $attempt]);
+            return;
+        }
+        
+        // Try to move file
+        if (move_uploaded_file($file['tmp_name'], $targetPath)) {
+            $moved = true;
+            break;
+        }
+        
+        // If not last attempt, wait before retry
+        if ($attempt < $maxRetries) {
+            sleep($retryDelay);
+            $retryDelay *= 2; // Exponential backoff
+        }
+    }
+    
+    if (!$moved) {
+        // Check if file was partially written
+        if (file_exists($targetPath)) {
+            @unlink($targetPath);
+        }
         http_response_code(500);
-        echo json_encode(['error' => 'Failed to save file']);
+        echo json_encode([
+            'error' => 'Failed to save file after ' . $maxRetries . ' attempts',
+            'check_disk_space' => disk_free_space($fullDirectoryPath)
+        ]);
         return;
     }
     
-    // Save to database
+    // Save to database with retry logic
     $relativePath = $username . '/' . ($directory_path ? $directory_path . '/' : '') . $storedName;
     $dbPath = $directory_path;
     
-    $stmt = $db->prepare("
-        INSERT INTO archive_files 
-        (user_id, username, original_name, stored_name, path, directory_path, mime, size)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ");
+    $maxDbRetries = 3;
+    $dbRetryDelay = 1;
+    $fileId = null;
     
-    $stmt->execute([
-        $user_id,
-        $username,
-        $originalName,
-        $storedName,
-        $relativePath,
-        $dbPath,
-        $file['type'] ?? 'application/octet-stream',
-        $file['size']
-    ]);
+    for ($dbAttempt = 1; $dbAttempt <= $maxDbRetries; $dbAttempt++) {
+        try {
+            // Reconnect if connection was lost
+            try {
+                $db->query('SELECT 1');
+            } catch (PDOException $e) {
+                $db = getDbConnection();
+            }
+            
+            $stmt = $db->prepare("
+                INSERT INTO archive_files 
+                (user_id, username, original_name, stored_name, path, directory_path, mime, size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ");
+            
+            $stmt->execute([
+                $user_id,
+                $username,
+                $originalName,
+                $storedName,
+                $relativePath,
+                $dbPath,
+                $file['type'] ?? 'application/octet-stream',
+                $file['size']
+            ]);
+            
+            $fileId = $db->lastInsertId();
+            break; // Success
+            
+        } catch (PDOException $e) {
+            if ($dbAttempt < $maxDbRetries) {
+                sleep($dbRetryDelay);
+                $dbRetryDelay *= 2;
+                continue;
+            }
+            
+            // Last attempt failed - rollback file
+            if (file_exists($targetPath)) {
+                @unlink($targetPath);
+            }
+            http_response_code(500);
+            echo json_encode(['error' => 'Database error: ' . $e->getMessage()]);
+            return;
+        }
+    }
     
-    $fileId = $db->lastInsertId();
+    if (!$fileId) {
+        // Rollback file if database insert failed
+        if (file_exists($targetPath)) {
+            @unlink($targetPath);
+        }
+        http_response_code(500);
+        echo json_encode(['error' => 'Failed to save file record to database']);
+        return;
+    }
     
     echo json_encode([
         'success' => true,
